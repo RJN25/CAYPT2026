@@ -34,6 +34,7 @@ class ClickLineSelector:
         self.roi = LineROI(active=False)
 
     def on_mouse(self, event, x, y, flags, param):
+        print("mouse event:", event, x, y)
         if not self._armed:
             return
         if event == cv2.EVENT_LBUTTONDOWN:
