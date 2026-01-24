@@ -1,5 +1,3 @@
-import argparse
-import os
 import time
 from collections import deque
 
@@ -9,6 +7,49 @@ from scipy.signal import find_peaks
 from skimage.morphology import skeletonize
 
 
+class DragROI:
+    def __init__(self):
+        self.dragging = False
+        self.active = False
+        self.p0 = None
+        self.p1 = None
+        self.roi = None  # (x0,y0,x1,y1) with x0<x1,y0<y1
+        self.armed = False
+
+    def arm(self):
+        self.armed = True
+        self.dragging = False
+        self.active = False
+        self.p0 = None
+        self.p1 = None
+        self.roi = None
+
+    def on_mouse(self, event, x, y, flags, param):
+        if not self.armed:
+            return
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.dragging = True
+            self.p0 = (x, y)
+            self.p1 = (x, y)
+
+        elif event == cv2.EVENT_MOUSEMOVE and self.dragging:
+            self.p1 = (x, y)
+
+        elif event == cv2.EVENT_LBUTTONUP and self.dragging:
+            self.dragging = False
+            self.p1 = (x, y)
+            x0 = min(self.p0[0], self.p1[0])
+            y0 = min(self.p0[1], self.p1[1])
+            x1 = max(self.p0[0], self.p1[0])
+            y1 = max(self.p0[1], self.p1[1])
+            # Reject tiny boxes
+            if (x1 - x0) > 20 and (y1 - y0) > 40:
+                self.roi = (x0, y0, x1, y1)
+                self.active = True
+            self.armed = False
+
+
 def band_mask(gray_roi: np.ndarray) -> np.ndarray:
     """Segment dark band on light background inside ROI."""
     g = cv2.GaussianBlur(gray_roi, (5, 5), 0)
@@ -16,14 +57,14 @@ def band_mask(gray_roi: np.ndarray) -> np.ndarray:
 
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     th = cv2.morphologyEx(th, cv2.MORPH_OPEN, k, iterations=1)
+    th = cv2.morphologyEx(th, cv2.THRESH_BINARY, k, iterations=0)
     th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, k, iterations=2)
     return th
 
 
 def centerline_x_per_row(mask: np.ndarray) -> np.ndarray:
-    """Skeletonize and return x(y) as mean skeleton x per row."""
     skel = skeletonize(mask > 0)
-    h, w = skel.shape
+    h, _ = skel.shape
     xs = np.full(h, np.nan, dtype=np.float32)
     for y in range(h):
         x_idx = np.where(skel[y])[0]
@@ -48,57 +89,48 @@ def smooth_1d(x: np.ndarray, k: int = 51) -> np.ndarray:
     return np.convolve(xp, kernel, mode="valid").astype(np.float32)
 
 
+def draw_points(frame, pts, color, r=5):
+    for (x, y) in pts:
+        cv2.circle(frame, (int(x), int(y)), r, color, -1, lineType=cv2.LINE_AA)
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Realtime bounding boxes per standing-wave loop (mode count).")
-    ap.add_argument("--cam", type=int, default=0)
-    ap.add_argument("--width", type=int, default=1920)
-    ap.add_argument("--height", type=int, default=1080)
-    ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--roi", type=int, nargs=4, metavar=("x0", "y0", "x1", "y1"),
-                    help="ROI around the band (HIGHLY recommended).")
-    ap.add_argument("--window_sec", type=float, default=1.0, help="Time window for RMS amplitude profile.")
-    ap.add_argument("--min_peak_dist", type=int, default=50, help="Min vertical distance between antinodes (pixels).")
-    ap.add_argument("--min_prom_frac", type=float, default=0.08,
-                    help="Peak prominence as fraction of max amplitude (0.05-0.15 typical).")
-    args = ap.parse_args()
-
-    cap = cv2.VideoCapture(args.cam, cv2.CAP_DSHOW)
+    cam_index = 0
+    cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open camera index {args.cam}")
+        raise RuntimeError(f"Could not open camera index {cam_index}")
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(args.width))
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(args.height))
-    cap.set(cv2.CAP_PROP_FPS, float(args.fps))
+    # Set capture size (adjust if needed)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920.0)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080.0)
+    cap.set(cv2.CAP_PROP_FPS, 30.0)
 
     ok, frame = cap.read()
     if not ok:
         raise RuntimeError("Camera opened but cannot read frames.")
 
     H, W = frame.shape[:2]
-    fps = cap.get(cv2.CAP_PROP_FPS) or args.fps
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
-    # Default ROI: middle strip (you should override with --roi)
-    if args.roi:
-        x0, y0, x1, y1 = args.roi
-    else:
-        x0, y0, x1, y1 = (W // 3, 0, 2 * W // 3, H)
+    roi_selector = DragROI()
 
-    roi_h = y1 - y0
-
-    # Tracking toggles
-    tracking = True
+    tracking = False
     baseline = None
 
-    # Buffer of displacements for RMS amplitude profile
-    window_frames = max(10, int(args.window_sec * fps))
+    window_sec = 1.0
+    window_frames = max(10, int(window_sec * fps))
     disp_buf = deque(maxlen=window_frames)
+
+    min_peak_dist = 50
+    min_prom_frac = 0.08
 
     # FPS estimate
     last = time.time()
     fps_est = 0.0
 
-    win = "Wave Boxes (q quit | t toggle tracking)"
+    win = "Wave Boxes (b select ROI | t tracking | q quit)"
     cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(win, roi_selector.on_mouse)
 
     while True:
         ok, frame = cap.read()
@@ -113,123 +145,114 @@ def main():
 
         display = frame.copy()
 
-        # Draw ROI
-        cv2.rectangle(display, (x0, y0), (x1, y1), (200, 200, 200), 1)
+        # Draw current ROI selection drag box (while dragging)
+        if roi_selector.dragging and roi_selector.p0 and roi_selector.p1:
+            cv2.rectangle(display, roi_selector.p0, roi_selector.p1, (255, 255, 0), 2)
 
-        mode_n = 0
+        # Draw active ROI
+        if roi_selector.active and roi_selector.roi:
+            x0, y0, x1, y1 = roi_selector.roi
+            cv2.rectangle(display, (x0, y0), (x1, y1), (200, 200, 200), 1)
 
-        if tracking:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray_roi = gray[y0:y1, x0:x1]
+            mode_n = 0
 
-            mask = band_mask(gray_roi)
-            xs = centerline_x_per_row(mask)
-            xs = nan_interp(xs)
+            if tracking:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray_roi = gray[y0:y1, x0:x1]
 
-            # If baseline not set, set it (string at rest-ish)
-            if baseline is None:
-                baseline = xs.copy()
+                mask = band_mask(gray_roi)
+                xs = centerline_x_per_row(mask)
+                xs = nan_interp(xs)
 
-            disp = xs - baseline
-            disp_buf.append(disp)
+                if baseline is None:
+                    baseline = xs.copy()
 
-            if len(disp_buf) >= max(8, window_frames // 2):
-                X = np.stack(disp_buf, axis=0)          # (T, Y)
-                A = np.sqrt(np.mean(X**2, axis=0))      # RMS amplitude along y
-                A = smooth_1d(A, k=51)
+                disp = xs - baseline
+                disp_buf.append(disp)
 
-                amax = float(np.max(A))
-                prom = max(1e-6, amax * args.min_prom_frac)
+                roi_h = y1 - y0
 
-                # Antinodes: peaks in A(y)
-                peaks, _ = find_peaks(A, distance=args.min_peak_dist, prominence=prom)
+                if len(disp_buf) >= max(8, window_frames // 2):
+                    X = np.stack(disp_buf, axis=0)
+                    A = np.sqrt(np.mean(X**2, axis=0))
+                    A = smooth_1d(A, k=51)
 
-                # Nodes: minima in A(y) -> peaks in -A(y)
-                mins, _ = find_peaks(-A, distance=args.min_peak_dist, prominence=prom * 0.5)
+                    amax = float(np.max(A))
+                    prom = max(1e-6, amax * min_prom_frac)
 
-                # We build boxes between adjacent nodes around each peak.
-                # If node detection fails, fallback: just count peaks (antinodes) and box around them.
-                mode_n = int(len(peaks))
+                    peaks, _ = find_peaks(A, distance=min_peak_dist, prominence=prom)
+                    mins, _ = find_peaks(-A, distance=min_peak_dist, prominence=prom * 0.5)
 
-                # Draw centerline (green)
-                pts = []
-                for yy in range(0, roi_h, 10):
-                    if np.isfinite(xs[yy]):
-                        pts.append((int(x0 + xs[yy]), int(y0 + yy)))
-                for i in range(1, len(pts)):
-                    cv2.line(display, pts[i - 1], pts[i], (0, 255, 0), 2, lineType=cv2.LINE_AA)
+                    mode_n = int(len(peaks))
 
-                # Build boxes
-                boxes = []
+                    # Draw centerline (green)
+                    pts = []
+                    for yy in range(0, roi_h, 10):
+                        if np.isfinite(xs[yy]):
+                            pts.append((int(x0 + xs[yy]), int(y0 + yy)))
+                    for i in range(1, len(pts)):
+                        cv2.line(display, pts[i - 1], pts[i], (0, 255, 0), 2, lineType=cv2.LINE_AA)
 
-                mins_sorted = np.sort(mins) if len(mins) else mins
-                peaks_sorted = np.sort(peaks)
+                    # Build loop boxes between nodes
+                    boxes = []
+                    mins_sorted = np.sort(mins)
+                    peaks_sorted = np.sort(peaks)
 
-                if len(mins_sorted) >= 2:
-                    # For each adjacent pair of nodes, see if an antinode lies between -> that's one "loop"
-                    for i in range(len(mins_sorted) - 1):
-                        y_top = int(mins_sorted[i])
-                        y_bot = int(mins_sorted[i + 1])
-                        mid_peaks = peaks_sorted[(peaks_sorted > y_top) & (peaks_sorted < y_bot)]
-                        if len(mid_peaks) == 0:
-                            continue
+                    if len(mins_sorted) >= 2:
+                        for i in range(len(mins_sorted) - 1):
+                            yt = int(mins_sorted[i])
+                            yb = int(mins_sorted[i + 1])
+                            mid_peaks = peaks_sorted[(peaks_sorted > yt) & (peaks_sorted < yb)]
+                            if len(mid_peaks) == 0:
+                                continue
 
-                        # Use that region as one loop box. Width based on max lateral excursion in that y-slab.
-                        slab = disp[y_top:y_bot]
-                        if len(slab) < 5:
-                            continue
+                            slab_A = A[yt:yb]
+                            w_px = int(max(12, 6 * float(np.max(slab_A)))) if len(slab_A) else 30
+                            y_mid = (yt + yb) // 2
+                            x_mid = float(xs[y_mid]) if np.isfinite(xs[y_mid]) else float(np.nanmean(xs[yt:yb]))
+                            if not np.isfinite(x_mid):
+                                continue
 
-                        # Estimate how "wide" the motion gets in this slab
-                        # Use RMS across time in slab: approximate by current amplitude A
-                        slab_A = A[y_top:y_bot]
-                        w_px = int(max(12, 6 * float(np.max(slab_A))))  # heuristic
+                            xl = int(x0 + x_mid - w_px)
+                            xr = int(x0 + x_mid + w_px)
+                            boxes.append((xl, y0 + yt, xr, y0 + yb))
+                    else:
+                        # Fallback: box around each antinode
+                        for y_peak in peaks_sorted:
+                            y_peak = int(y_peak)
+                            h_box = 80
+                            yt = max(0, y_peak - h_box // 2)
+                            yb = min(roi_h - 1, y_peak + h_box // 2)
+                            slab_A = A[yt:yb]
+                            w_px = int(max(12, 6 * float(np.max(slab_A)))) if len(slab_A) else 30
+                            x_mid = float(xs[y_peak]) if np.isfinite(xs[y_peak]) else float(np.nanmean(xs))
+                            if not np.isfinite(x_mid):
+                                continue
+                            xl = int(x0 + x_mid - w_px)
+                            xr = int(x0 + x_mid + w_px)
+                            boxes.append((xl, y0 + yt, xr, y0 + yb))
 
-                        # Center x from baseline in the middle of slab
-                        y_mid = (y_top + y_bot) // 2
-                        x_mid = float(xs[y_mid]) if np.isfinite(xs[y_mid]) else float(np.nanmean(xs[y_top:y_bot]))
+                    # Draw boxes (yellow) + labels
+                    for j, (xl, yt, xr, yb) in enumerate(boxes, start=1):
+                        xl = max(0, xl); xr = min(W - 1, xr)
+                        yt = max(0, yt); yb = min(H - 1, yb)
+                        cv2.rectangle(display, (xl, yt), (xr, yb), (0, 255, 255), 2)
+                        cv2.putText(display, f"{j}", (xl + 6, yt + 22),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
+                        cv2.putText(display, f"{j}", (xl + 6, yt + 22),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 1, cv2.LINE_AA)
 
-                        if not np.isfinite(x_mid):
-                            continue
+            # HUD for ROI active
+            hud2 = f"ROI set. TRACKING={'ON' if tracking else 'OFF'}  Mode n~{mode_n}"
+            cv2.putText(display, hud2, (10, H - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(display, hud2, (10, H - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
 
-                        x_left = int(x0 + x_mid - w_px)
-                        x_right = int(x0 + x_mid + w_px)
-
-                        boxes.append((x_left, y0 + y_top, x_right, y0 + y_bot))
-                else:
-                    # Fallback: box around each antinode peak y with a fixed height
-                    for y_peak in peaks_sorted:
-                        y_peak = int(y_peak)
-                        h_box = 80
-                        y_top = max(0, y_peak - h_box // 2)
-                        y_bot = min(roi_h - 1, y_peak + h_box // 2)
-
-                        slab_A = A[y_top:y_bot]
-                        w_px = int(max(12, 6 * float(np.max(slab_A)))) if len(slab_A) else 30
-                        x_mid = float(xs[y_peak]) if np.isfinite(xs[y_peak]) else float(np.nanmean(xs))
-
-                        if not np.isfinite(x_mid):
-                            continue
-
-                        x_left = int(x0 + x_mid - w_px)
-                        x_right = int(x0 + x_mid + w_px)
-                        boxes.append((x_left, y0 + y_top, x_right, y0 + y_bot))
-
-                # Draw boxes + label
-                for j, (xl, yt, xr, yb) in enumerate(boxes, start=1):
-                    xl = max(0, xl); xr = min(W - 1, xr)
-                    yt = max(0, yt); yb = min(H - 1, yb)
-                    cv2.rectangle(display, (xl, yt), (xr, yb), (0, 255, 255), 2)  # yellow
-                    cv2.putText(display, f"{j}", (xl + 6, yt + 22),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
-                    cv2.putText(display, f"{j}", (xl + 6, yt + 22),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 1, cv2.LINE_AA)
-
-        # HUD
+        # Main HUD
         hud = [
-            f"TRACKING={'ON' if tracking else 'OFF'}   fps~{fps_est:.1f}",
-            f"Mode estimate n = {mode_n}   (yellow boxes ~= loops/antinodes)",
-            "Keys: t toggle tracking | q quit",
-            "Tip: set a tight ROI around the band for stability."
+            f"fps~{fps_est:.1f}",
+            "Keys: b select ROI (click+drag) | t toggle tracking | q quit",
         ]
         ytxt = 25
         for line in hud:
@@ -237,14 +260,28 @@ def main():
             cv2.putText(display, line, (10, ytxt), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
             ytxt += 24
 
+        if roi_selector.armed:
+            msg = "ROI SELECT MODE: click and drag a rectangle around the band"
+            cv2.putText(display, msg, (10, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(display, msg, (10, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 1, cv2.LINE_AA)
+
         cv2.imshow(win, display)
         key = cv2.waitKey(1) & 0xFF
+
         if key == ord("q"):
             break
-        if key == ord("t"):
-            tracking = not tracking
+        elif key == ord("b"):
+            roi_selector.arm()
+            tracking = False
             baseline = None
             disp_buf.clear()
+        elif key == ord("t"):
+            if roi_selector.active and roi_selector.roi:
+                tracking = not tracking
+                baseline = None
+                disp_buf.clear()
 
     cap.release()
     cv2.destroyAllWindows()
