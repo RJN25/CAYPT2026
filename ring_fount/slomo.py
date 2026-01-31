@@ -4,6 +4,9 @@ Slomo: slow down a video extremely for frame-by-frame analysis.
 Reads an input video and writes a new video where each original frame
 is repeated many times, so playback is very slow (e.g. 0.1x–0.05x speed).
 Useful for analyzing fast motion (e.g. juggling, sports).
+
+Run with no arguments to open a file picker and choose a .mov or .mp4.
+Or: python slomo.py path/to/video.mp4
 """
 
 import argparse
@@ -11,6 +14,14 @@ import sys
 from pathlib import Path
 
 import cv2
+
+# Optional: file dialog when run with no args (tkinter is in the stdlib)
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+    _HAS_FILEDIALOG = True
+except ImportError:
+    _HAS_FILEDIALOG = False
 
 
 def get_video_info(cap: cv2.VideoCapture) -> tuple[float, int, int, int]:
@@ -78,6 +89,42 @@ def slow_down_video(
         out.release()
 
 
+VIDEO_TYPES = (
+    ("Video files", "*.mp4 *.mov *.avi *.mkv"),
+    ("MP4", "*.mp4"),
+    ("QuickTime", "*.mov"),
+    ("All files", "*.*"),
+)
+
+
+def pick_input_and_output(slowdown: float = 20.0) -> tuple[Path, Path] | None:
+    """Open file picker for .mov/.mp4, then save-as for output. Returns (input_path, output_path) or None if cancelled."""
+    if not _HAS_FILEDIALOG:
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    input_path = filedialog.askopenfilename(
+        title="Choose a video to analyze (.mov or .mp4)",
+        filetypes=VIDEO_TYPES,
+    )
+    if not input_path:
+        return None
+    input_path = Path(input_path)
+    default_name = f"{input_path.stem}_slomo{input_path.suffix or '.mp4'}"
+    output_path = filedialog.asksaveasfilename(
+        title="Save slowed video as",
+        initialfile=default_name,
+        initialdir=str(input_path.parent),
+        filetypes=VIDEO_TYPES,
+        defaultextension=input_path.suffix or ".mp4",
+    )
+    root.destroy()
+    if not output_path:
+        return None
+    return input_path, Path(output_path)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Slow down a video extremely for frame-by-frame analysis."
@@ -85,7 +132,9 @@ def main() -> int:
     parser.add_argument(
         "input",
         type=Path,
-        help="Input video file path",
+        nargs="?",
+        default=None,
+        help="Input video file path (omit to open file picker)",
     )
     parser.add_argument(
         "-o", "--output",
@@ -107,7 +156,18 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if args.output is None:
+    # No input path → open file picker
+    if args.input is None:
+        if not _HAS_FILEDIALOG:
+            print("Usage: python slomo.py <path/to/video.mp4>", file=sys.stderr)
+            print("Or install tkinter for a file picker.", file=sys.stderr)
+            return 1
+        picked = pick_input_and_output(slowdown=args.slowdown)
+        if picked is None:
+            print("Cancelled.")
+            return 0
+        args.input, args.output = picked
+    elif args.output is None:
         stem = args.input.stem
         suffix = args.input.suffix or ".mp4"
         args.output = args.input.parent / f"{stem}_slomo{suffix}"
